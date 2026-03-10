@@ -44,12 +44,52 @@ type Executor interface {
 	Shutdown(ctx context.Context) error
 }
 
+// streamState tracks per-stream concurrency limits declared by the client
+// in GetWorkItemsRequest. Semaphores are nil when the limit is 0 (unlimited).
+type streamState struct {
+	activitySem     chan struct{} // buffered channel semaphore; nil = unlimited
+	orchestratorSem chan struct{} // buffered channel semaphore; nil = unlimited
+	slotFreed       chan struct{} // buffered(1) notification on every completion
+}
+
+func newStreamState(maxActivities, maxOrchestrators int32) *streamState {
+	ss := &streamState{
+		slotFreed: make(chan struct{}, 1),
+	}
+	if maxActivities > 0 {
+		ss.activitySem = make(chan struct{}, maxActivities)
+	}
+	if maxOrchestrators > 0 {
+		ss.orchestratorSem = make(chan struct{}, maxOrchestrators)
+	}
+	return ss
+}
+
+func (ss *streamState) semForWorkItem(wi *protos.WorkItem) chan struct{} {
+	switch wi.Request.(type) {
+	case *protos.WorkItem_ActivityRequest:
+		return ss.activitySem
+	case *protos.WorkItem_OrchestratorRequest:
+		return ss.orchestratorSem
+	}
+	return nil
+}
+
+// signalSlotFreed performs a non-blocking send to wake a stream waiting for capacity.
+func (ss *streamState) signalSlotFreed() {
+	select {
+	case ss.slotFreed <- struct{}{}:
+	default:
+	}
+}
+
 type grpcExecutor struct {
 	protos.UnimplementedTaskHubSidecarServiceServer
 
 	workItemQueue            chan *protos.WorkItem
 	pendingOrchestrators     *sync.Map // map[api.InstanceID]*pendingOrchestrator
 	pendingActivities        *sync.Map // map[string]*pendingActivity
+	streams                  *sync.Map // map[string]*streamState
 	backend                  Backend
 	logger                   Logger
 	onWorkItemConnection     func(context.Context) error
@@ -111,6 +151,7 @@ func NewGrpcExecutor(be Backend, logger Logger, opts ...grpcExecutorOptions) (ex
 		logger:               logger,
 		pendingOrchestrators: &sync.Map{},
 		pendingActivities:    &sync.Map{},
+		streams:              &sync.Map{},
 	}
 
 	for _, opt := range opts {
@@ -284,6 +325,16 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 	}
 
 	streamID := uuid.NewString()
+	ss := newStreamState(
+		req.GetMaxConcurrentActivityWorkItems(),
+		req.GetMaxConcurrentOrchestrationWorkItems(),
+	)
+	g.streams.Store(streamID, ss)
+
+	if ss.activitySem != nil || ss.orchestratorSem != nil {
+		g.logger.Infof("stream %s: concurrency limits activity=%d orchestrator=%d",
+			streamID, req.GetMaxConcurrentActivityWorkItems(), req.GetMaxConcurrentOrchestrationWorkItems())
+	}
 
 	// There are some cases where the app may need to be notified when a client connects to fetch work items, like
 	// for auto-starting the worker. The app also has an opportunity to set itself as unavailable by returning an error.
@@ -299,6 +350,8 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 	}
 
 	defer func() {
+		g.streams.Delete(streamID)
+
 		// If there's any pending activity left, remove them
 		g.pendingActivities.Range(func(key, value any) bool {
 			if p, ok := value.(*pendingActivity); ok && p.streamID == streamID {
@@ -348,6 +401,24 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 		case wi, ok := <-g.workItemQueue:
 			if !ok {
 				continue
+			}
+
+			// Enforce per-stream concurrency limits
+			if sem := ss.semForWorkItem(wi); sem != nil {
+				select {
+				case sem <- struct{}{}: // acquired slot
+				default:
+					// At capacity — requeue so another stream (or this one later) can pick it up
+					go func() { g.workItemQueue <- wi }()
+					select {
+					case <-ss.slotFreed:
+					case <-stream.Context().Done():
+						return nil
+					case <-g.streamShutdownChan:
+						return errShuttingDown
+					}
+					continue
+				}
 			}
 
 			switch x := wi.Request.(type) {
@@ -423,11 +494,13 @@ func (g *grpcExecutor) executeOnWorkItemDisconnect(ctx context.Context) error {
 
 // CompleteOrchestratorTask implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) CompleteOrchestratorTask(ctx context.Context, res *protos.OrchestratorResponse) (*protos.CompleteTaskResponse, error) {
+	g.releaseOrchestratorSlot(res.GetInstanceId())
 	return emptyCompleteTaskResponse, g.backend.CompleteOrchestratorTask(ctx, res)
 }
 
 // CompleteActivityTask implements protos.TaskHubSidecarServiceServer
 func (g *grpcExecutor) CompleteActivityTask(ctx context.Context, res *protos.ActivityResponse) (*protos.CompleteTaskResponse, error) {
+	g.releaseActivitySlot(res.GetInstanceId(), res.GetTaskId())
 	return emptyCompleteTaskResponse, g.backend.CompleteActivityTask(ctx, res)
 }
 
@@ -694,6 +767,49 @@ func createGetInstanceResponse(req *protos.GetInstanceRequest, metadata *Orchest
 	}
 
 	return &protos.GetInstanceResponse{Exists: true, OrchestrationState: state}
+}
+
+// releaseActivitySlot releases a concurrency slot for the stream that handled this activity.
+func (g *grpcExecutor) releaseActivitySlot(instanceID string, taskID int32) {
+	key := GetActivityExecutionKey(instanceID, taskID)
+	value, ok := g.pendingActivities.Load(key)
+	if !ok {
+		return
+	}
+	p, ok := value.(*pendingActivity)
+	if !ok || p.streamID == "" {
+		return
+	}
+	ssVal, ok := g.streams.Load(p.streamID)
+	if !ok {
+		return
+	}
+	ss := ssVal.(*streamState)
+	if ss.activitySem != nil {
+		<-ss.activitySem
+		ss.signalSlotFreed()
+	}
+}
+
+// releaseOrchestratorSlot releases a concurrency slot for the stream that handled this orchestrator.
+func (g *grpcExecutor) releaseOrchestratorSlot(instanceID string) {
+	value, ok := g.pendingOrchestrators.Load(api.InstanceID(instanceID))
+	if !ok {
+		return
+	}
+	p, ok := value.(*pendingOrchestrator)
+	if !ok || p.streamID == "" {
+		return
+	}
+	ssVal, ok := g.streams.Load(p.streamID)
+	if !ok {
+		return
+	}
+	ss := ssVal.(*streamState)
+	if ss.orchestratorSem != nil {
+		<-ss.orchestratorSem
+		ss.signalSlotFreed()
+	}
 }
 
 func (executor *grpcExecutor) AbandonTaskActivityWorkItem(ctx context.Context, in *protos.AbandonActivityTaskRequest) (*protos.AbandonActivityTaskResponse, error) {
